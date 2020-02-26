@@ -1,0 +1,123 @@
+---
+title: "Analyze Emrah Stool Proteomics Bacteria"
+author: "Hui/Jonathan"
+date: "`r format(Sys.Date(), '%B %d, %Y')`"
+output: word_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, include = FALSE)
+setwd("B:/")
+source("fcns/config.r")
+setwd("kahn/emrah/emrah_stoolProteomics/bacteria")
+library("plyr")
+```
+
+##Input files, in folder [emrah_stoolProteomics](//jdcnas1/cores/Bioinformatics/kahn/emrah/emrah_stoolProteomics)  
+(1) [Altindis E SAM00828_MUSTMT10PLX-FTK_ BACTERIA Database_40%coisol_Perc_1%FDR 160629.csv](//jdcnas1/cores/bioinformatics/kahn/emrah/emrah_stoolProteomics/bacteria/Altindis E SAM00828_MUSTMT10PLX-FTK_ BACTERIA Database_40%coisol_Perc_1%FDR 160629.csv).  
+(2) [pheno.csv](//jdcnas1/cores/bioinformatics/kahn/emrah/emrah_stoolProteomics/pheno.csv).  
+
+```{r parse}
+pheno <- read.csv("../pheno.csv", row.names = 1)
+
+dat <- read.csv("Altindis E SAM00828_MUSTMT10PLX-FTK_ BACTERIA Database_40%coisol_Perc_1%FDR 160629.csv")
+dat$Contaminant <- as.logical(dat$Contaminant)
+dat$Exp..q.value <- as.numeric(dat$Exp..q.value)
+dat <- dat[!(dat$Contaminant|is.na(dat$Exp..q.value)), ]
+rownames(dat) <- dat$Accession
+
+annot <- dat[, c("Accession", "Gene.ID", "Description")]
+annot$Gene.ID[annot$Gene.ID == ""] <- annot$Accession[annot$Gene.ID == ""]
+
+mat <- data.matrix(dat[, grep("Abundance..F1", colnames(dat))])
+colnames(mat) <- gsub(".*F1\\.\\.|\\.\\.(Sam|Con).*", "", colnames(mat))
+mat <- mat[, match(pheno$Label, colnames(mat))]
+colnames(mat) <- rownames(pheno)
+```
+
+## Filtering, imputation and normalization
+```{r filtering, imputation and normalization}
+# filter NAs
+hist(rowMeans(is.na(mat)))
+mat <- mat[rowMeans(is.na(mat)) < 0.8, ]
+sum(is.na(mat))
+# imput NAs with half of row minimums
+mat <- t(apply(mat, 1, function(v){v[is.na(v)] <- min(v, na.rm = TRUE)/2; v}))
+# normalize to column sum and log transform
+mat <- log2(apply(mat, 2, function(v) v*max(colSums(mat))/sum(v)))
+pdf("bacteria_log2_box.pdf")
+boxplot(mat, ylab = "log Abundance", las=2)
+dev.off()
+```
+(1) Filter out proteins have more than 80% NAs.
+(2) Impute the single NA left after step (1) with half of its row minimum, as is done in metabolomics.
+(3) Normalized protein abundance to the column sums, as suggested by Ryan. This essentially normalizes the means, also, but after normalization the medians and distributions are still quite different between arrays, as you'll see in the boxplot, next. 
+(4) Log2 transform protein abundance. See [bacteria_log2_box.pdf](//jdcnas1/cores/bioinformatics/kahn/emrah/emrah_stoolProteomics/bacteria/bacteria_log2_box.pdf).  
+
+## Quality control
+```{r qc}
+# pca
+multi.pca(mat, pheno, color = "Group", name = "bacteria_pca")
+# see trend, flat
+voom(2^mat, plot = TRUE)
+```
+PCA plot [bacteria_pca.png](//jdcnas1/cores/bioinformatics/kahn/emrah/emrah_stoolProteomics/bacteria/bacteria_pca.png).  There is some degree of separation between Chow diet and others.  
+
+## Limma analysis
+```{r limma}
+contr.v = c(HFDvsChow = "HFD - Chow", VancvsHFD = "Vanc - HFD",
+            MetrvsHFD = "Metr - HFD", MetrvsVanc="Metr - Vanc")
+mtt <- limma.contrasts(mat, pheno$Group, contr.v)
+mtt.df <- data.frame(signif(mtt, 3), annot[rownames(mtt), ])
+sig.hist(mtt, name = "bacteria_sig_hist")
+write.csv(mtt.df, "bacteria_protein_stats.csv", na = "")
+```
+(1) p-values and FDR distribution [bacteria_sig_hist.pdf](//jdcnas1/cores/bioinformatics/kahn/emrah/emrah_stoolProteomics/bacteria/bacteria_sig_hist.pdf). There are significant p-values and FDR in HFD vs. Chow and Metr vs. HFD comparisons.
+(2) Differential protein statistics [bacteria_protein_stats.csv](//jdcnas1/cores/bioinformatics/kahn/emrah/emrah_stoolProteomics/bacteria/bacteria_protein_stats.csv).  
+
+##Plots
+```{r plots}
+# volcanoe plots
+multi.volcano(mtt.df, sym.col = "Gene.ID", n.top = 5, name = "bacteria_volcanoes")
+
+# heat maps
+topp <- rownames(mtt)
+my.heat(mat[topp, ], symbols = annot[topp, "Description"], name = "bacteria_all_group",
+        Colv = FALSE, margins = c(7, 20), labCol = pheno$Group)
+my.heat(mat[topp, pheno$Group != "Chow"], symbols = annot[topp, "Description"], 
+        name = "bacteria_no_chow", Colv = FALSE, margins = c(7, 20), 
+        labCol = pheno$Group[pheno$Group != "Chow"])
+my.heat(mat[topp, !pheno$Group %in% c("Vanc", "Metr")], symbols = annot[topp, "Description"], 
+        name = "bacteria_no_antibiotics", Colv = FALSE, margins = c(7, 20), 
+        labCol = pheno$Group[!pheno$Group %in% c("Vanc", "Metr")])
+
+# bar plots
+pdf("bacteria_topprotein_barplots.pdf")
+for(p in topp) {
+    dat2p <- data.frame(Protein = 2^(mat[p, ])/mean(2^mat[p, 4:6]), Group = pheno$Group)
+    dat2p <- ddply(dat2p, .(Group), summarise, N = length(Protein), Mean = mean(Protein),
+                   SE = sd(Protein)/sqrt(N))
+    
+    g <- ggplot(dat2p, aes(Group, Mean, fill = Group)) 
+    g <- g + geom_bar(stat = "identity", width = 0.7) + guides(fill=FALSE) 
+    g <- g + theme_bw() + geom_errorbar(aes(ymax = Mean + SE, ymin = Mean - SE, width = 0.35))
+    g <- g + labs(y = "Relative abundance", title =annot[p, "Description"])
+    plot(g)
+}
+dev.off()
+```
+(1) Volcanoe plots [bacteria_volcanoes.pdf](//jdcnas1/cores/bioinformatics/kahn/emrah/emrah_stoolProteomics/bacteria/bacteria_volcanoes.pdf).  
+(2) Heat maps. 
+* All groups [bacteria_all_group_heat.pdf](//jdcnas1/cores/bioinformatics/kahn/emrah/emrah_stoolProteomics/bacteria/bacteria_all_group_heat.pdf);
+* Without chow diet  [bacteria_no_chow_heat.pdf](//jdcnas1/cores/bioinformatics/kahn/emrah/emrah_stoolProteomics/bacteria/bacteria_no_chow_heat.pdf);
+* Without antibiotics [bacteria_no_antibiotics_heat.pdf](//jdcnas1/cores/bioinformatics/kahn/emrah/emrah_stoolProteomics/bacteria/bacteria_no_antibiotics_heat.pdf).  
+(3) Bar plots. [bacteria_topprotein_barplots.pdf](//jdcnas1/cores/bioinformatics/kahn/emrah/emrah_stoolProteomics/bacteria/bacteria_topprotein_barplots.pdf).  
+
+```{r check}
+all(rownames(mat)%in% rownames(annot))
+all(colnames(mat) == rownames(pheno))
+mtt.df[1, "Description"] == "type III secretion protein [Photorhabdus asymbiotica]"
+mtt.df[1, 'HFDvsChow.FC'] < -1.5
+mtt.df[which(mtt.df$Description == "hypothetical protein [Clostridium sp. CAG:510]"), 'VancvsHFD.logFC'] > 0.5
+```
+
